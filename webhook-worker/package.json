@@ -1,0 +1,14 @@
+{
+  "name": "clickup-webhook",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker — receives ClickUp webhook events and forwards them to Clawdbot gateway",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.99.0"
+  }
+}

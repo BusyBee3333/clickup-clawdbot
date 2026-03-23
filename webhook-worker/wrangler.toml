@@ -1,0 +1,16 @@
+name = "clickup-webhook"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+account_id = "2ab41abbaef7afaa6b844a72957f078a"
+
+# Route on custom domain (DNS must point to Cloudflare)
+routes = [
+  { pattern = "hooks.mcpengage.com/clickup/*", zone_name = "mcpengage.com" }
+]
+
+# Secrets (set via `wrangler secret put`):
+#   WEBHOOK_SECRET       — HMAC-SHA256 shared secret from ClickUp webhook registration
+#   CLAWDBOT_GATEWAY_URL — gateway endpoint to forward normalized events to
+
+[vars]
+ENVIRONMENT = "production"
