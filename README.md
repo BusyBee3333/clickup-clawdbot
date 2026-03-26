@@ -29,9 +29,15 @@ Clawdbot AI Session
   • Uses `clickup` CLI to fetch context (task details, comments)
   • Posts reply via `clickup comment` or `clickup chat send`
 
-chat-poller.js  (runs on cron, every ~5 min)
+ws-daemon.js  (long-running, Playwright)
+  • Intercepts ClickUp's WebSocket stream (frontdoor-prod.pusher.com)
+  • True realtime: zero polling delay for @mentions, comments, chat
+  • Logs all WS frames, triggers callbacks on mention detection
+  • Requires: Playwright (npm install playwright)
+
+chat-poller.js  (runs on cron, every ~5 min — fallback if WS unavailable)
   • Polls all ClickUp Chat channels ClickUp webhooks don't cover
-  • Detects @Oogie mentions
+  • Detects @mentions
   • Outputs JSON for the cron to handle
 
 briefing.js  (runs daily)
@@ -51,7 +57,8 @@ monitor.js  (runs on demand or cron)
 | CLI | `cli/clickup.js` | Node ≥ 18 (no deps) |
 | Webhook Worker | `webhook-worker/` | Cloudflare Workers |
 | Event Handler | `scripts/clickup-event-handler.js` | Node daemon (launchd/systemd) |
-| Chat Poller | `scripts/chat-poller.js` | Node cron job (5-min) |
+| WebSocket Daemon | `scripts/ws-daemon.js` | Node + Playwright (long-running) |
+| Chat Poller | `scripts/chat-poller.js` | Node cron job (5-min, fallback) |
 | Chat Daemon | `scripts/chat-daemon.js` | Node daemon (15-second realtime) |
 | Full Scanner | `scripts/full-scan.py` | Python 3 cron job |
 | Morning Briefing | `scripts/briefing.js` | Node cron job |
@@ -127,6 +134,41 @@ CLICKUP_API_KEY=xxx node scripts/clickup-event-handler.js
 ```
 
 The handler listens on `127.0.0.1:3482` and wakes your Clawdbot session when meaningful events arrive.
+
+### 5. (Optional) Start the WebSocket Daemon
+
+For true realtime notifications without webhooks or polling, use the WebSocket daemon. It intercepts ClickUp's internal WebSocket stream via a headless browser.
+
+```bash
+# Install Playwright (one-time)
+npm install playwright
+npx playwright install chromium
+
+# Run the daemon
+CLICKUP_EMAIL=you@example.com \
+CLICKUP_PASSWORD=yourpassword \
+CLICKUP_USER_ID=12345 \
+node scripts/ws-daemon.js
+```
+
+**How it works:** ClickUp's web app connects to `frontdoor-prod.pusher.com` via WebSocket for realtime updates. The daemon launches a headless Chromium, logs in, and intercepts all WebSocket frames. When it detects an @mention of your user ID, it logs the event and optionally POSTs to a callback URL.
+
+**Environment Variables:**
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `CLICKUP_EMAIL` | Yes | ClickUp login email |
+| `CLICKUP_PASSWORD` | Yes | ClickUp login password |
+| `CLICKUP_USER_ID` | No | Your user ID (enables @mention detection) |
+| `CLICKUP_WS_LOG` | No | Path to raw WS log file (default: `/tmp/clickup-ws-raw.log`) |
+| `CLICKUP_WS_CALLBACK` | No | URL to POST when a mention is detected |
+| `CLICKUP_WS_TIMEOUT` | No | Session timeout in ms (0 = run forever) |
+| `CLICKUP_WS_HEADED` | No | Set `true` for visible browser (debugging) |
+
+**When to use which:**
+- **WebSocket daemon** — true realtime, catches everything including Chat DMs that webhooks miss, but requires Playwright + credentials
+- **Webhook worker** — production-grade, HMAC-verified, but ClickUp doesn't fire webhooks for Chat messages
+- **Chat poller** — simple fallback, 5-min polling interval, no browser needed
 
 ---
 
