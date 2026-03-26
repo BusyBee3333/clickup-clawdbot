@@ -122,51 +122,35 @@ clickup webhook create https://your-worker.workers.dev/clickup/webhook \
 
 Copy the **webhook secret** from the response and set it as `WEBHOOK_SECRET` in the worker.
 
-### 4. Start the Local Event Handler
+### 4. Start the Local Event Handler & WebSocket Daemon
+
+We use **PM2** to manage both the webhook event handler and the WebSocket daemon. The WS daemon provides true realtime alerts (including Chat DMs), while the webhook handles structural task changes.
 
 ```bash
-# Run directly
-CLICKUP_API_KEY=xxx node scripts/clickup-event-handler.js
+# Install PM2 globally
+npm install -g pm2
 
-# Or install as a launchd service (macOS) — see SETUP.md
-```
-
-The handler listens on `127.0.0.1:3482` and wakes your Clawdbot session when meaningful events arrive.
-
-### 5. (Optional) Start the WebSocket Daemon
-
-For true realtime notifications without webhooks or polling, use the WebSocket daemon. It intercepts ClickUp's internal WebSocket stream via a headless browser.
-
-```bash
-# Install Playwright (one-time)
+# Install Playwright (required for the WS daemon)
 npm install playwright
 npx playwright install chromium
 
-# Run the daemon
-CLICKUP_EMAIL=you@example.com \
-CLICKUP_PASSWORD=yourpassword \
-CLICKUP_USER_ID=12345 \
-node scripts/ws-daemon.js
+# Export your credentials
+export CLICKUP_EMAIL=you@example.com
+export CLICKUP_PASSWORD=yourpassword
+export CLICKUP_USER_ID=12345
+export CLICKUP_API_KEY=pk_xxxxxxxxxx
+
+# Start both services
+pm2 start ecosystem.config.js
+pm2 save
 ```
 
-**How it works:** ClickUp's web app connects to `frontdoor-prod.pusher.com` via WebSocket for realtime updates. The daemon launches a headless Chromium, logs in, and intercepts all WebSocket frames. When it detects an @mention of your user ID, it logs the event and optionally POSTs to a callback URL.
-
-**Environment Variables:**
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `CLICKUP_EMAIL` | Yes | ClickUp login email |
-| `CLICKUP_PASSWORD` | Yes | ClickUp login password |
-| `CLICKUP_USER_ID` | No | Your user ID (enables @mention detection) |
-| `CLICKUP_WS_LOG` | No | Path to raw WS log file (default: `/tmp/clickup-ws-raw.log`) |
-| `CLICKUP_WS_CALLBACK` | No | URL to POST when a mention is detected |
-| `CLICKUP_WS_TIMEOUT` | No | Session timeout in ms (0 = run forever) |
-| `CLICKUP_WS_HEADED` | No | Set `true` for visible browser (debugging) |
+The handler listens on `127.0.0.1:3482` and wakes your Clawdbot session when meaningful events arrive. The WS daemon intercepts the live WebSocket stream and forwards mentions to that same handler.
 
 **When to use which:**
-- **WebSocket daemon** — true realtime, catches everything including Chat DMs that webhooks miss, but requires Playwright + credentials
-- **Webhook worker** — production-grade, HMAC-verified, but ClickUp doesn't fire webhooks for Chat messages
-- **Chat poller** — simple fallback, 5-min polling interval, no browser needed
+- **WebSocket daemon** — true realtime, catches everything including Chat DMs that webhooks miss. Requires Playwright.
+- **Webhook worker** — production-grade, HMAC-verified for structural changes.
+- **Chat poller** — *Deprecated fallback*. Use WS daemon instead.
 
 ---
 
