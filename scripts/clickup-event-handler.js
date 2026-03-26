@@ -76,7 +76,7 @@ const server = http.createServer(async (req, res) => {
  */
 function shouldTriggerWake(event) {
   // Always wake if someone mentioned @Oogie
-  if (event.mentioned_oogie) return true;
+  if (event.mentioned_oogie || event.event === "mention") return true;
   
   // Wake on new comments (someone might need a response)
   if (event.event === 'taskCommentPosted') return true;
@@ -106,6 +106,14 @@ function shouldTriggerWake(event) {
  * Build the wake text that Clawdbot will process as a system event.
  */
 function buildWakeText(event) {
+  // WebSocket mention events get fast-tracked with raw payload context
+  if (event.event === "mention") {
+    const rawSnippet = event.payload ? event.payload.substring(0, 500) : '';
+    return 'ClickUp Realtime WebSocket Alert: You were just tagged in ClickUp! '
+      + 'The raw WebSocket payload is: ' + rawSnippet
+      + '. Please use your ClickUp skill to read the latest comments and reply natively.';
+  }
+
   const userName = event.user?.username || 'Someone';
   const taskId = event.task_id || 'unknown';
   
@@ -138,46 +146,23 @@ function buildWakeText(event) {
  * Falls back to file-based wake if the gateway is unreachable.
  */
 async function triggerCronWake(text) {
-  return new Promise((resolve, reject) => {
-    const data = JSON.stringify({
-      tool: 'cron',
-      args: {
-        action: 'wake',
-        text: text,
-        mode: 'next-heartbeat'
-      }
+  return new Promise((resolve) => {
+    const { execFile } = require('child_process');
+    
+    // Configurable openclaw CLI path, target, and instruction suffix
+    const openclawBin = process.env.CLICKUP_OPENCLAW_BIN || 'openclaw';
+    const target = process.env.CLICKUP_AGENT_TARGET || 'main';
+    const extraInstructions = process.env.CLICKUP_WAKE_INSTRUCTIONS || '';
+    
+    const fullText = text + (extraInstructions ? ' ' + extraInstructions : '');
+    
+    // Use execFile (no shell) to avoid injection from ClickUp comment content
+    const args = ['agent', '--target', target, '--message', fullText];
+    const child = execFile(openclawBin, args, { timeout: 15000 }, (error) => {
+      if (error) console.log('[wake-error]', error.message);
+      resolve();
     });
-    
-    const options = {
-      hostname: '127.0.0.1',
-      port: 18789, // Clawdbot gateway port
-      path: '/tools/invoke',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data),
-      },
-    };
-    
-    const req = http.request(options, (res) => {
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => {
-        console.log(`[wake-result] ${res.statusCode}: ${body.substring(0, 200)}`);
-        resolve(body);
-      });
-    });
-    
-    req.on('error', (err) => {
-      console.error(`[wake-error] ${err.message} — falling back to file-based wake`);
-      // Fallback: write event to a file that the cron poller will pick up
-      const wakePath = path.join(LOG_DIR, 'pending-wakes.jsonl');
-      fs.appendFileSync(wakePath, JSON.stringify({ text, ts: new Date().toISOString() }) + '\n');
-      resolve('filed');
-    });
-    
-    req.write(data);
-    req.end();
+    child.unref(); // fire-and-forget
   });
 }
 
@@ -186,6 +171,6 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`[clickup-event-handler] Event log: ${EVENT_LOG}`);
 });
 
-// Graceful shutdown
+// Graceful shutdown (PM2 sends SIGTERM on restart/cron_restart)
 process.on('SIGTERM', () => { console.log('[shutdown] SIGTERM'); server.close(); process.exit(0); });
 process.on('SIGINT', () => { console.log('[shutdown] SIGINT'); server.close(); process.exit(0); });

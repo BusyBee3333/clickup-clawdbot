@@ -58,9 +58,7 @@ monitor.js  (runs on demand or cron)
 | Webhook Worker | `webhook-worker/` | Cloudflare Workers |
 | Event Handler | `scripts/clickup-event-handler.js` | Node daemon (launchd/systemd) |
 | WebSocket Daemon | `scripts/ws-daemon.js` | Node + Playwright (long-running) |
-| Chat Poller | `scripts/chat-poller.js` | Node cron job (5-min, fallback) |
-| Chat Daemon | `scripts/chat-daemon.js` | Node daemon (15-second realtime) |
-| Full Scanner | `scripts/full-scan.py` | Python 3 cron job |
+| Chat Poller | `scripts/chat-poller.js` | Node cron job (fallback) |
 | Morning Briefing | `scripts/briefing.js` | Node cron job |
 | Health Monitor | `scripts/monitor.js` | Node cron job |
 | Clawdbot Skill | `skill/SKILL.md` | Clawdbot agent context |
@@ -325,57 +323,6 @@ CLICKUP_API_KEY=xxx node scripts/chat-poller.js
 
 ---
 
-### Chat Daemon (`scripts/chat-daemon.js`)
-
-Near-realtime @mention detection daemon. Polls all accessible channels every 15 seconds (vs. the 5-minute cron approach of `chat-poller.js`).
-
-```bash
-# Minimal — just polls and logs mentions
-CLICKUP_WORKSPACE_ID=xxx \
-CLICKUP_AGENT_NAME=myagent \
-node scripts/chat-daemon.js
-
-# With Telegram alerts
-CLICKUP_WORKSPACE_ID=xxx \
-CLICKUP_AGENT_NAME=myagent \
-TELEGRAM_BOT_TOKEN=xxx \
-TELEGRAM_CHAT_ID=-1001234567890 \
-node scripts/chat-daemon.js
-
-# With auto-reply in ClickUp Chat
-CLICKUP_WORKSPACE_ID=xxx \
-CLICKUP_AGENT_NAME=myagent \
-CLICKUP_AUTO_REPLY=1 \
-CLICKUP_AUTO_REPLY_TEXT="Got it — working on it now." \
-node scripts/chat-daemon.js
-```
-
-All configuration is via environment variables — see the [Adapting to Your Workspace](#adapting-to-your-workspace) section for the full list.
-
----
-
-### Full Scan (`scripts/full-scan.py`)
-
-Python 3 script that performs a comprehensive workspace scan: task comments, attachments, and Chat channel mentions — with deduplication so previously-seen items are never surfaced again.
-
-```bash
-# Scan specific spaces
-CLICKUP_WORKSPACE_ID=xxx \
-CLICKUP_SPACE_IDS=space1,space2 \
-CLICKUP_CHANNEL_IDS=channel1,channel2 \
-CLICKUP_USER_ID=<your-user-id> \
-python3 scripts/full-scan.py
-
-# Scan specific lists directly
-CLICKUP_WORKSPACE_ID=xxx \
-CLICKUP_LIST_IDS=list1,list2 \
-python3 scripts/full-scan.py
-```
-
-Outputs `CLEAN` (nothing new) or a JSON array of findings to stdout. Designed to run as a cron job and pipe output to your agent runtime.
-
----
-
 ### Event Handler (`scripts/clickup-event-handler.js`)
 
 Local HTTP server (port 3482) that receives forwarded events from the Cloudflare Worker and decides which ones are worth waking the AI agent.
@@ -481,115 +428,16 @@ bash skill/install.sh
 
 ---
 
-## ClickUp API — Lessons Learned
-
-Hard-won lessons from production usage. Read these before building new integrations.
-
-### Chat DMs have no public API
-
-ClickUp Chat **direct messages (DMs) are not accessible via the API**. The v3 `/chat/channels` endpoint returns only public channels and private channels you're a member of. DMs are excluded entirely — you can't read or send DMs programmatically.
-
-Workaround: use task comments or public Chat channels for agent-to-human communication.
-
-### @mentions in comments require `type: "tag"` objects
-
-Posting a plain text string like `"Hey @alice"` in a comment does **not** create a proper @mention notification. To tag a user so they receive a ClickUp notification, you must post a rich comment body using the `comment` array format:
-
-```json
-{
-  "comment": [
-    {
-      "text": "Hey ",
-      "type": "text"
-    },
-    {
-      "type": "tag",
-      "text": "@alice",
-      "attrs": {
-        "id": "<USER_ID>",
-        "username": "alice",
-        "email": "alice@example.com"
-      }
-    },
-    {
-      "text": " can you review this?",
-      "type": "text"
-    }
-  ]
-}
-```
-
-Using `comment_text` (the simple string field) will never notify anyone.
-
-### Conversation view comments cannot be deleted via API
-
-Comments posted to a **Conversation view** (the chat-like threaded view on a task) cannot be deleted via the `DELETE /api/v2/task/{id}/comment/{comment_id}` endpoint. The API returns `200` but the comment persists. This appears to be a ClickUp bug — there is no known workaround as of mid-2025.
-
-Regular task comments (non-Conversation-view) can be deleted normally.
-
-### `PUT /api/v2/space/{id}` nulls the space name if `name` is omitted
-
-ClickUp's space update endpoint is not a partial-update (PATCH) — it is a full replace. If you call `PUT /api/v2/space/{id}` with a body that doesn't include the `name` field, the space name will be set to `null` and disappear from the UI.
-
-**Always include `"name"` in your body when updating a space**, even if you're only changing another field:
-
-```js
-// ✅ Safe — includes name
-await api(`/space/${spaceId}`, { method: 'PUT', body: { name: existingName, color: '#ff0000' } });
-
-// ❌ Dangerous — nukes the space name
-await api(`/space/${spaceId}`, { method: 'PUT', body: { color: '#ff0000' } });
-```
-
-This applies to `statuses`, `features`, and other top-level fields too — omitting them may clear their values.
-
-### Rate limits are generous, but bulk operations need spacing
-
-The ClickUp v2 API is generally forgiving on rate limits for typical usage. However, when running bulk operations (scanning many tasks, fetching comments for 50+ tasks in a loop, etc.), add a ~200ms delay between requests to avoid `429 Too Many Requests` errors:
-
-```js
-for (const task of tasks) {
-  await fetchComments(task.id);
-  await new Promise(r => setTimeout(r, 200)); // 200ms spacing
-}
-```
-
-The `briefing.js` and `monitor.js` scripts already include retry-after handling for `429` responses.
-
----
-
 ## Adapting to Your Workspace
 
-All workspace-specific values are now configurable via environment variables — no hardcoded IDs in the scripts.
+This integration was built for **The Burton Method** workspace, but is easy to adapt:
 
-### Required environment variables
-
-| Variable | Description |
-|---|---|
-| `CLICKUP_API_KEY` | Your ClickUp API token |
-| `CLICKUP_WORKSPACE_ID` | Your workspace (team) ID |
-
-### Optional environment variables
-
-| Variable | Used by | Description |
-|---|---|---|
-| `CLICKUP_API_KEY_FILE` | All scripts + CLI | Path to a file containing your API token. Default: `~/.agents/secrets/clickup-api-key.txt`. Useful for agent runtimes that store secrets in files rather than env vars. |
-| `CLICKUP_SPACE_IDS` | `briefing.js`, `full-scan.py` | Comma-separated space IDs to scan. If omitted, `briefing.js` scans the entire workspace; `full-scan.py` requires this or `CLICKUP_LIST_IDS`. |
-| `CLICKUP_LIST_IDS` | `full-scan.py` | Comma-separated list IDs to scan directly (alternative to `CLICKUP_SPACE_IDS`). |
-| `CLICKUP_CHANNEL_ID` | `briefing.js`, `monitor.js` | Channel to post reports to when using `--post`. |
-| `CLICKUP_CHANNEL_IDS` | `full-scan.py` | Comma-separated channel IDs to check for mentions. |
-| `CLICKUP_AGENT_NAME` | `chat-poller.js`, `chat-daemon.js` | Your agent's display name (default: `oogie` for `chat-poller.js`, `rose` for `chat-daemon.js`). |
-| `CLICKUP_AGENT_USER_ID` | `chat-daemon.js`, `full-scan.py` | Your agent's ClickUp user ID — own messages are skipped. |
-| `CLICKUP_BOT_USER_ID` | `chat-poller.js` | Numeric user ID of the bot — own messages are skipped. |
-| `CLICKUP_POLL_MS` | `chat-daemon.js` | Poll interval in milliseconds (default: 15000). |
-| `CLICKUP_STATE_FILE` | `chat-poller.js`, `chat-daemon.js`, `full-scan.py` | Path to the dedup/state JSON file. |
-| `TELEGRAM_BOT_TOKEN` | `chat-daemon.js` | Telegram bot token for alerts. |
-| `TELEGRAM_CHAT_ID` | `chat-daemon.js` | Telegram chat/group to send alerts to. |
-| `CLICKUP_AUTO_REPLY` | `chat-daemon.js` | Set to `1` to auto-reply in ClickUp Chat when mentioned. |
-
-### Webhook worker
-
-Update `webhook-worker/wrangler.toml` with your Cloudflare `account_id` and `routes`.
+1. **Workspace ID** — replace `9013713404` in `cli/clickup.js` (`DEFAULT_WORKSPACE_ID`), scripts, and `skill/SKILL.md`
+2. **Space IDs** — update `SPACE_IDS` in `scripts/briefing.js` and `scripts/monitor.js`
+3. **Channel IDs** — update `DEFAULT_CHANNEL_ID` in both scripts
+4. **Secret name** — update `SECRET_NAME` in `skill/install.sh` and all `signet secret exec` calls in `skill/SKILL.md`
+5. **Agent name** — replace `oogie`/`Oogie` with your agent's name in `webhook-worker/src/index.js` (`checkOogieMention`) and `scripts/chat-poller.js` (`mentionsOogie`)
+6. **wrangler.toml** — update `account_id` and `routes` with your Cloudflare account and domain
 
 ---
 
@@ -607,9 +455,7 @@ clickup-clawdbot/
 ├── scripts/
 │   ├── briefing.js             # Daily morning briefing generator
 │   ├── monitor.js              # Task health monitor
-│   ├── chat-poller.js          # Chat channel @mention poller (5-min cron)
-│   ├── chat-daemon.js          # Realtime @mention daemon (15-second polling)
-│   ├── full-scan.py            # Full workspace scan — comments, attachments, mentions
+│   ├── chat-poller.js          # Chat channel @mention poller
 │   └── clickup-event-handler.js # Local event server (port 3482)
 ├── skill/
 │   ├── SKILL.md                # Clawdbot agent skill context
