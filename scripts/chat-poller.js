@@ -13,16 +13,43 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
-const WORKSPACE_ID = '9013713404';
-const BASE_V3 = `https://api.clickup.com/api/v3/workspaces/${WORKSPACE_ID}`;
-const STATE_FILE = path.join(__dirname, '..', 'logs', 'chat-poller-state.json');
-const API_KEY = process.env.CLICKUP_API_KEY;
-
-if (!API_KEY) {
-  console.error('CLICKUP_API_KEY required');
+// ── Auth & Config ─────────────────────────────────────────────────────────────
+// API key resolution order:
+//   1. CLICKUP_API_KEY env var
+//   2. Contents of CLICKUP_API_KEY_FILE (default: ~/.agents/secrets/clickup-api-key.txt)
+function resolveApiKey() {
+  if (process.env.CLICKUP_API_KEY) return process.env.CLICKUP_API_KEY;
+  try {
+    const keyFile = process.env.CLICKUP_API_KEY_FILE ||
+      path.join(os.homedir(), '.agents', 'secrets', 'clickup-api-key.txt');
+    const key = fs.readFileSync(keyFile, 'utf8').trim();
+    if (key) return key;
+  } catch { /* fall through */ }
+  console.error('CLICKUP_API_KEY (or CLICKUP_API_KEY_FILE) is required');
   process.exit(1);
 }
+
+const API_KEY = resolveApiKey();
+
+// Workspace ID — set CLICKUP_WORKSPACE_ID env var
+const WORKSPACE_ID = process.env.CLICKUP_WORKSPACE_ID || (() => {
+  console.error('CLICKUP_WORKSPACE_ID is required');
+  process.exit(1);
+})();
+
+const BASE_V3 = `https://api.clickup.com/api/v3/workspaces/${WORKSPACE_ID}`;
+
+// State file location — override with CLICKUP_CHAT_POLLER_STATE
+const STATE_FILE = process.env.CLICKUP_CHAT_POLLER_STATE ||
+  path.join(__dirname, '..', 'logs', 'chat-poller-state.json');
+
+// Agent name to detect in mentions — override with CLICKUP_AGENT_NAME
+const AGENT_NAME = (process.env.CLICKUP_AGENT_NAME || 'oogie').toLowerCase();
+
+// Bot user ID to skip (your agent's own messages) — override with CLICKUP_BOT_USER_ID
+const BOT_USER_ID = process.env.CLICKUP_BOT_USER_ID ? Number(process.env.CLICKUP_BOT_USER_ID) : null;
 
 const headers = {
   'Authorization': API_KEY,
@@ -69,9 +96,11 @@ async function getMessages(channelId, limit = 20) {
   }
 }
 
-function mentionsOogie(text) {
+function mentionsAgent(text) {
   if (!text) return false;
-  return /\boogie\b/i.test(text);
+  // Match the configured agent name as a word boundary (case-insensitive)
+  const escaped = AGENT_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\b${escaped}\\b`, 'i').test(text);
 }
 
 function extractText(message) {
@@ -117,12 +146,12 @@ async function main() {
       const msgTime = parseInt(msg.date || msg.created_at || '0');
       if (msgTime && msgTime < sinceMs) continue;
       
-      // Skip messages from Jake Shore's API token (that's us posting)
-      if (msg.user?.id === 126241816) continue;
-      
+      // Skip messages from the bot's own user ID (if configured)
+      if (BOT_USER_ID && msg.user?.id === BOT_USER_ID) continue;
+
       const text = extractText(msg);
-      
-      if (mentionsOogie(text)) {
+
+      if (mentionsAgent(text)) {
         mentions.push({
           channel_id: channel.id,
           channel_name: channel.name || '(unknown)',
@@ -145,7 +174,7 @@ async function main() {
     // Output mentions as JSON for the cron to process
     console.log(JSON.stringify({ mentions, count: mentions.length }));
   } else {
-    console.error('[chat-poller] No new @Oogie mentions');
+    console.error(`[chat-poller] No new @${AGENT_NAME} mentions`);
   }
 }
 

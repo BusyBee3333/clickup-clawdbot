@@ -3,14 +3,35 @@
 // Zero external deps — uses built-in fetch (Node 18+)
 // Usage: CLICKUP_API_KEY=xxx node monitor.js [--post] [--notify] [--json] [--channel CHANNEL_ID]
 
-const API_KEY = process.env.CLICKUP_API_KEY;
-if (!API_KEY) {
-  console.error('Error: CLICKUP_API_KEY environment variable is required');
+// ── Auth & Config ─────────────────────────────────────────────────────────────
+// API key resolution order:
+//   1. CLICKUP_API_KEY env var
+//   2. Contents of CLICKUP_API_KEY_FILE (default: ~/.agents/secrets/clickup-api-key.txt)
+function resolveApiKey() {
+  if (process.env.CLICKUP_API_KEY) return process.env.CLICKUP_API_KEY;
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const os = require('os');
+    const keyFile = process.env.CLICKUP_API_KEY_FILE ||
+      path.join(os.homedir(), '.agents', 'secrets', 'clickup-api-key.txt');
+    const key = fs.readFileSync(keyFile, 'utf8').trim();
+    if (key) return key;
+  } catch { /* fall through */ }
+  console.error('Error: no ClickUp API key found. Set CLICKUP_API_KEY or CLICKUP_API_KEY_FILE.');
   process.exit(1);
 }
 
-const TEAM_ID = '9013713404';
-const DEFAULT_CHANNEL_ID = '4-90132878675-8';
+const API_KEY = resolveApiKey();
+
+// Workspace (team) ID — set CLICKUP_WORKSPACE_ID to override
+const TEAM_ID = process.env.CLICKUP_WORKSPACE_ID || (() => {
+  console.error('Error: CLICKUP_WORKSPACE_ID is required');
+  process.exit(1);
+})();
+
+// Chat channel for --post flag
+const DEFAULT_CHANNEL_ID = process.env.CLICKUP_CHANNEL_ID || '';
 const BASE_URL = 'https://api.clickup.com/api/v2';
 const BASE_URL_V3 = 'https://api.clickup.com/api/v3';
 

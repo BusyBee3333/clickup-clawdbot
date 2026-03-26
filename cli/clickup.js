@@ -2,7 +2,9 @@
 // clickup - ClickUp CLI for AI agents
 // Single-file, zero-dependency CLI for the ClickUp API (v2 + v3 chat)
 
-const DEFAULT_WORKSPACE_ID = '9013713404';
+// Default workspace ID — override with CLICKUP_WORKSPACE_ID env var.
+// The placeholder below is intentionally empty; set CLICKUP_WORKSPACE_ID before use.
+const DEFAULT_WORKSPACE_ID = process.env.CLICKUP_WORKSPACE_ID || '';
 
 // ── ANSI helpers ──────────────────────────────────────────────────────────────
 const c = {
@@ -17,17 +19,54 @@ const bold = t => paint(c.bold, t);
 const dim = t => paint(c.dim, t);
 
 // ── Config & Auth ─────────────────────────────────────────────────────────────
+
+/**
+ * Resolve the ClickUp API token.
+ *
+ * Resolution order:
+ *   1. CLICKUP_API_KEY environment variable
+ *   2. CLICKUP_TOKEN environment variable
+ *   3. Contents of the file at CLICKUP_API_KEY_FILE (default: ~/.agents/secrets/clickup-api-key.txt)
+ *
+ * This fallback lets agent runtimes that store secrets in files (e.g. Signet /
+ * OpenClaw) work without explicitly exporting env vars.
+ */
 function getToken() {
   const token = process.env.CLICKUP_API_KEY || process.env.CLICKUP_TOKEN;
-  if (!token) {
-    console.error(paint(c.red, '✗ No API token found. Set CLICKUP_API_KEY or CLICKUP_TOKEN env var.'));
-    process.exit(1);
+  if (token) return token;
+
+  // File-based fallback
+  try {
+    const fs = require('fs');
+    const os = require('os');
+    const keyFile = process.env.CLICKUP_API_KEY_FILE ||
+      require('path').join(os.homedir(), '.agents', 'secrets', 'clickup-api-key.txt');
+    const fromFile = fs.readFileSync(keyFile, 'utf8').trim();
+    if (fromFile) return fromFile;
+  } catch {
+    // File not found or unreadable — fall through to error
   }
-  return token;
+
+  console.error(paint(c.red, '✗ No API token found. Set CLICKUP_API_KEY, CLICKUP_TOKEN, or CLICKUP_API_KEY_FILE env var.'));
+  process.exit(1);
 }
 
+/**
+ * Return the workspace (team) ID.
+ *
+ * Resolution order:
+ *   1. CLICKUP_WORKSPACE_ID environment variable
+ *   2. DEFAULT_WORKSPACE_ID constant (empty unless set above)
+ *
+ * Exits with an error if no workspace ID is available when one is required.
+ */
 function getWorkspaceId() {
-  return process.env.CLICKUP_WORKSPACE_ID || DEFAULT_WORKSPACE_ID;
+  const id = process.env.CLICKUP_WORKSPACE_ID || DEFAULT_WORKSPACE_ID;
+  if (!id) {
+    console.error(paint(c.red, '✗ No workspace ID found. Set CLICKUP_WORKSPACE_ID env var.'));
+    process.exit(1);
+  }
+  return id;
 }
 
 // ── HTTP client ───────────────────────────────────────────────────────────────
@@ -582,8 +621,9 @@ ${bold('Global Flags:')}
   ${dim('--help')}    Show help for a command
 
 ${bold('Environment:')}
-  CLICKUP_API_KEY or CLICKUP_TOKEN    API token (required)
-  CLICKUP_WORKSPACE_ID               Workspace ID (default: ${DEFAULT_WORKSPACE_ID})
+  CLICKUP_API_KEY or CLICKUP_TOKEN    API token
+  CLICKUP_API_KEY_FILE               Path to file containing API token (default: ~/.agents/secrets/clickup-api-key.txt)
+  CLICKUP_WORKSPACE_ID               Workspace (team) ID — required if not set in env
 `);
 }
 
