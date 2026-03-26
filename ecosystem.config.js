@@ -8,7 +8,7 @@ module.exports = {
       watch: false,
       max_memory_restart: '500M',
       // Restart the daemon every 12 hours to prevent memory leaks and stale websockets
-      cron_restart: '0 */12 * * *',
+      cron_restart: '*/15 * * * *',
       env: {
         NODE_ENV: 'production',
         // ClickUp credentials
@@ -18,7 +18,7 @@ module.exports = {
         
         // Where to send detection events (points to your local Clawdbot instance or relay)
         // Default: point to the event handler script which already knows how to wake Clawdbot
-        CLICKUP_WS_CALLBACK: 'http://127.0.0.1:3482/webhook',
+        CLICKUP_WS_CALLBACK: 'http://127.0.0.1:3482/clickup/event',
         
         // Optional logging
         CLICKUP_WS_LOG: '/tmp/clickup-ws-raw.log',
