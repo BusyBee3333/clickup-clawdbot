@@ -103,21 +103,50 @@ const SESSION_REFRESH_INTERVAL = TIMEOUT > 0 ? TIMEOUT : 14 * 60 * 1000; // Cycl
             let payload = frame.payload;
             if (typeof payload !== 'string') payload = payload.toString('utf8');
             try { fs.appendFileSync(LOG_FILE, payload + '\n'); } catch {}
+            // Skip noise: heartbeats, auth, pusher control frames
             if (payload.includes('heartbeat') || payload.includes('AuthReceived') || payload.includes('pusher:')) return;
-            if (USER_ID && payload.includes(USER_ID)) {
-              console.log('\n' + '='.repeat(60));
-              console.log(`[MENTION DETECTED] ${new Date().toISOString()}`);
-              console.log(payload.substring(0, 500));
-              console.log('='.repeat(60) + '\n');
-              notifyCallback('mention', payload);
-            }
+
             try {
               const data = JSON.parse(payload);
-              const eventName = data.event || '';
-              if (eventName.includes('Comment') || eventName.includes('chat') || eventName.includes('task')) {
-                console.log(`[ws-daemon] Event: ${eventName} (${payload.length} bytes)`);
+              const msgType = data.msg || '';
+              const eventName = data.event?.name || data.event || '';
+
+              // Log meaningful events
+              if (eventName.includes('Comment') || eventName.includes('comment') ||
+                  eventName.includes('chat') || eventName.includes('task')) {
+                console.log(`[ws-daemon] Event: ${msgType || eventName} (${payload.length} bytes)`);
               }
-            } catch {}
+
+              // Only forward REAL mention-worthy events to event handler:
+              // - commentCreated (someone commented on a task we're on)
+              // - taskUpdate with comment context
+              // - chatMessageCreated (chat message mentioning us)
+              // SKIP: inboxMessageToUser, mark-bundle-read, syncUserOperation, heartbeatReply
+              const SKIP_MSGS = ['inboxMessageToUser', 'heartbeatReply', 'presenceUpdate', 'syncUserOperation'];
+              if (SKIP_MSGS.includes(msgType)) return;
+
+              // Also skip if the event payload method is a read receipt
+              const payloadMethod = data.event?.payload?.method || '';
+              if (payloadMethod === 'syncUserOperation' || payloadMethod === 'mark-bundle-read') return;
+
+              // Check if this event involves our user (is directed at us or mentions us)
+              if (USER_ID && payload.includes(USER_ID)) {
+                // Only forward comment-related events
+                const isCommentEvent = msgType.includes('comment') || msgType.includes('Comment') ||
+                  eventName.includes('comment') || eventName.includes('Comment') ||
+                  msgType === 'taskUpdate' || msgType === 'chatMessageCreated';
+
+                if (isCommentEvent) {
+                  console.log('\n' + '='.repeat(60));
+                  console.log(`[MENTION DETECTED] ${new Date().toISOString()} (${msgType || eventName})`);
+                  console.log(payload.substring(0, 500));
+                  console.log('='.repeat(60) + '\n');
+                  notifyCallback('mention', payload);
+                }
+              }
+            } catch {
+              // Non-JSON payload or parse error — skip silently
+            }
           });
 
           ws.on('close', () => { console.log('[ws-daemon] WebSocket closed by server.'); wsConnected = false; });
