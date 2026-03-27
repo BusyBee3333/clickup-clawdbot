@@ -465,6 +465,7 @@ async function triggerCronWake(text) {
   const body = JSON.stringify({
     message: fullText,
     name: 'ClickUp',
+    sessionKey: 'hook:clickup',  // Fixed key — reuses one persistent session, one slot
     wakeMode: 'now',
     deliver: false,
     timeoutSeconds: 90,
