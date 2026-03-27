@@ -34,53 +34,133 @@ const WORKSPACE_ID = '9013713404';
 // Ensure log directory
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 
-// ── Unified dedup: normalized key across ALL event sources ────────────
-const DEDUP_WINDOW_MS = 15000;
-const recentEvents = new Map();
+// ── Dedup + Debounce: one comment = one wake ─────────────────────────
+const DEDUP_WINDOW_MS = 30000; // 30s window (wider since debounce handles the fast stuff)
+const DEBOUNCE_MS = 3000;       // Wait 3s to collect all events about the same task
+const recentEvents = new Map(); // key → timestamp (dedup)
+const pendingWakes = new Map(); // taskKey → { timer, bestEvent, wakeText }
 
 /**
- * Normalize dedup key so WS mentions + CF webhooks about the SAME
- * comment/task action collapse to one key.
- *
- * Strategy: extract the object_id (task ID) from any event source,
- * then bucket by 5-second windows so near-simultaneous events dedup.
+ * Extract a stable task-level key from any event type.
+ * All events about the same task collapse to one key.
  */
-function dedupKey(event) {
-  let objectId = event.task_id || '';
-  let bucket = Math.floor(Date.now() / 5000); // 5-second buckets
+function extractTaskKey(event) {
+  // Direct task_id from CF webhooks
+  if (event.task_id) return `task:${event.task_id}`;
 
-  // WS mention events: extract object_id from raw payload
+  // Chat mentions key by channel
+  if (event.event === 'chat_mention') return `chat:${event.channel_id || ''}:${event.message_id || ''}`;
+
+  // WS mention events: dig into payload for task-level IDs
   if (event.event === 'mention' && event.payload) {
     try {
       const p = typeof event.payload === 'string' ? event.payload : JSON.stringify(event.payload);
-      const match = p.match(/"object_id":"([^"]+)"/);
-      if (match) objectId = match[1];
+      const wsData = typeof event.payload === 'string' ? JSON.parse(event.payload) : event.payload;
+
+      // Get the object type — if it's a comment, we need the parent task
+      const objectType = wsData?.event?.version_change?.object_type || '';
+      const objectId = wsData?.event?.version_change?.object_id || '';
+      const eventName = wsData?.event?.name || wsData?.msg || '';
+
+      // For task-level events, use the task ID directly
+      if (objectType === 'task' && objectId) return `task:${objectId}`;
+
+      // For comment events, try to find a task reference in the payload
+      // Comments don't always carry the parent task ID in WS payloads,
+      // but task updates about the same comment DO have the task ID.
+      // Use the event name + a time bucket to group them.
+      if (objectType === 'comment' || eventName.includes('comment') || eventName.includes('Comment')) {
+        // Group all comment events in the same 5s window
+        const bucket = Math.floor(Date.now() / 5000);
+        return `comment-group:${bucket}`;
+      }
+
+      if (objectId) return `obj:${objectId}`;
     } catch {}
   }
 
-  // Chat mention events: use channel + message ID
-  if (event.event === 'chat_mention') {
-    return `chat:${event.channel_id || ''}:${event.message_id || ''}`;
-  }
-
-  return `${objectId}:${bucket}`;
+  // Fallback: time-bucketed key
+  return `unknown:${Math.floor(Date.now() / 5000)}`;
 }
 
+/**
+ * Check if this exact event was already seen (hard dedup).
+ */
 function isDuplicate(event) {
-  const key = dedupKey(event);
+  const key = extractTaskKey(event) + ':' + (event.event || '');
   const now = Date.now();
   const prev = recentEvents.get(key);
   if (prev && (now - prev) < DEDUP_WINDOW_MS) {
     return true;
   }
   recentEvents.set(key, now);
-  // Prune old entries
-  if (recentEvents.size > 200) {
+  if (recentEvents.size > 300) {
     for (const [k, ts] of recentEvents) {
       if (now - ts > DEDUP_WINDOW_MS * 2) recentEvents.delete(k);
     }
   }
   return false;
+}
+
+/**
+ * Score an event by how much context it carries.
+ * Higher = better candidate for the wake text.
+ */
+function eventRichness(event) {
+  let score = 0;
+  if (event.task_id) score += 10;              // Has a direct task ID
+  if (event.comment_text) score += 5;          // Has comment text
+  if (event.mentioned_oogie) score += 3;       // Explicitly mentions us
+  if (event.event === 'chat_mention') score += 8; // Chat mentions are always important
+  if (event.event === 'mention') {
+    // WS mentions with comment context
+    try {
+      const wsData = typeof event.payload === 'string' ? JSON.parse(event.payload) : event.payload;
+      const eventName = wsData?.event?.name || '';
+      if (eventName.includes('comment') || eventName.includes('Comment')) score += 7;
+      if (wsData?.event?.version_change?.object_type === 'task') score += 4;
+    } catch {}
+  }
+  return score;
+}
+
+/**
+ * Queue a wake with debounce. Multiple events about the same task
+ * within DEBOUNCE_MS get merged — only the richest event fires.
+ */
+function queueDebouncedWake(event, inputPath) {
+  const taskKey = extractTaskKey(event);
+  const richness = eventRichness(event);
+  const existing = pendingWakes.get(taskKey);
+
+  if (existing) {
+    // Replace if this event is richer (has more context)
+    if (richness > existing.richness) {
+      existing.bestEvent = event;
+      existing.richness = richness;
+      existing.inputPath = inputPath;
+      console.log(`[debounce] Upgraded pending wake for ${taskKey} (richness ${existing.richness} → ${richness})`);
+    } else {
+      console.log(`[debounce] Merged into pending wake for ${taskKey} (keeping richness ${existing.richness})`);
+    }
+    return;
+  }
+
+  // New task key — start debounce timer
+  const entry = {
+    bestEvent: event,
+    richness,
+    inputPath,
+    timer: setTimeout(async () => {
+      pendingWakes.delete(taskKey);
+      const e = entry.bestEvent;
+      const wakeText = buildWakeText(e);
+      console.log(`[debounce] Firing wake for ${taskKey} (richness ${entry.richness}, path ${entry.inputPath}): ${wakeText.substring(0, 100)}...`);
+      await triggerCronWake(wakeText);
+    }, DEBOUNCE_MS),
+  };
+  pendingWakes.set(taskKey, entry);
+  console.log(`[debounce] Queued wake for ${taskKey} (richness ${richness}, fires in ${DEBOUNCE_MS}ms)`);
 }
 
 // ── Self-echo detection (comprehensive) ──────────────────────────────
@@ -219,9 +299,8 @@ const server = http.createServer(async (req, res) => {
         const shouldWake = shouldTriggerWake(event);
 
         if (shouldWake) {
-          const wakeText = buildWakeText(event);
-          console.log(`[wake] Triggering (${inputPath}): ${wakeText.substring(0, 120)}...`);
-          await triggerCronWake(wakeText);
+          // Debounced: queue the event, best one fires after 3s
+          queueDebouncedWake(event, inputPath);
         }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
