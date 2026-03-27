@@ -234,7 +234,8 @@ function buildReport(health) {
 
 async function postToChat(message, channelId) {
   const url = `${BASE_URL_V3}/workspaces/${TEAM_ID}/chat/channels/${channelId}/messages`;
-  const body = { content: [{ text: message, type: 'text' }] };
+  // ClickUp v3 chat API expects content as a plain string
+  const body = { content: message };
   return apiFetch(url, { method: 'POST', body: JSON.stringify(body) });
 }
 

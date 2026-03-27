@@ -5,3 +5,4 @@ logs/
 .env
 .DS_Store
 package-lock.json
+.auth-state.json

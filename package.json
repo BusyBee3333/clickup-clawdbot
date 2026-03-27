@@ -1,0 +1,25 @@
+{
+  "name": "clickup-clawdbot",
+  "version": "1.0.0",
+  "description": "A complete integration layer between **ClickUp** and **Clawdbot** (an AI agent runtime). Enables your AI agent to read and write ClickUp tasks, monitor project health, respond to webhook events in real time, and send messages in ClickUp Chat — all from a single zero-dependency CLI.",
+  "main": "ecosystem.config.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BusyBee3333/clickup-clawdbot.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/BusyBee3333/clickup-clawdbot/issues"
+  },
+  "homepage": "https://github.com/BusyBee3333/clickup-clawdbot#readme",
+  "dependencies": {
+    "playwright": "^1.58.2",
+    "ws": "^8.20.0"
+  }
+}
