@@ -171,6 +171,35 @@ async function autoReply(channelId, msgId, senderName) {
   }
 }
 
+/**
+ * Forward chat mention to the unified event handler so Clawdbot can
+ * process it intelligently (not just auto-reply with a canned message).
+ */
+async function forwardToEventHandler(channelId, channelName, msgId, senderName, content) {
+  const EVENT_HANDLER_URL = process.env.CLICKUP_EVENT_HANDLER_URL || 'http://127.0.0.1:3482/clickup/chat-mention';
+  try {
+    const res = await fetch(EVENT_HANDLER_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'chat_mention',
+        channel_id: channelId,
+        channel_name: channelName,
+        message_id: msgId,
+        sender_name: senderName,
+        message_text: cleanContent(content),
+      }),
+    });
+    if (res.ok) {
+      console.log(`[forward] Sent chat mention to event handler for Clawdbot processing`);
+    } else {
+      console.error(`[forward] Event handler returned ${res.status}`);
+    }
+  } catch (e) {
+    console.error(`[forward] Failed to reach event handler: ${e.message}`);
+  }
+}
+
 
 // ── Poll loop ──────────────────────────────────────────────────────────────────
 
@@ -203,6 +232,9 @@ async function poll() {
             const sender = await getMemberName(userId);
             console.log(`[mention] #${chName} from ${sender}: ${content.substring(0, 80)}`);
             await sendTelegram(chName, sender, content);
+            // Forward to event handler → Clawdbot for intelligent response
+            await forwardToEventHandler(chId, chName, String(msg.id || ''), sender, content);
+            // Auto-reply is optional fallback (disabled by default now that Clawdbot handles it)
             await autoReply(chId, String(msg.id || ''), sender);
           }
         }

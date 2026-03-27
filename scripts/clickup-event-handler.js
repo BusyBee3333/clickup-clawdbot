@@ -1,18 +1,20 @@
 #!/usr/bin/env node
 /**
- * ClickUp Event Handler — Local HTTP server that receives forwarded
- * webhook events from the CF Worker and triggers Clawdbot cron wakes.
+ * ClickUp Event Handler v2 — Unified event receiver for Clawdbot
  *
- * This runs as a launchd service on the Mac Mini.
- * Listens on port 3472.
+ * Receives events from:
+ *   1. CF Worker webhook (POST /clawdbot/clickup)
+ *   2. WS daemon mention forwards (POST /clickup/event)
+ *   3. Chat daemon mention forwards (POST /clickup/chat-mention) [NEW]
  *
- * Flow:
- *   CF Worker → POST hooks.mcpengage.com/clawdbot/clickup → this server
- *   → cron wake → Clawdbot session processes the event
+ * All paths converge here → dedup → self-echo filter → wake Clawdbot
+ *
+ * Clawdbot response path: wake text includes the CLI command to reply
+ * directly on ClickUp (task comment or chat message). No shell scripts,
+ * no curl, no signet secret exec — just the CLI.
  */
 
 const http = require('http');
-const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
@@ -20,22 +22,48 @@ const PORT = 3482;
 const LOG_DIR = path.join(__dirname, '..', 'logs');
 const EVENT_LOG = path.join(LOG_DIR, 'events.jsonl');
 
+// ── Our ClickUp identity (jake@burtonmethod.com) ─────────────────────
+const OUR_USER_ID = '126241816';
+const OUR_USER_ID_NUM = 126241816;
+
+// ── CLI path for response instructions ────────────────────────────────
+const CLI_PATH = '/Users/jackshard/projects/clickup-clawdbot/cli/clickup.js';
+const API_KEY_FILE = '~/.agents/secrets/clickup-api-key.txt';
+const WORKSPACE_ID = '9013713404';
+
 // Ensure log directory
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 
-// ── Dedup: same task+event within window → skip ───────────────────────
-const DEDUP_WINDOW_MS = 15000; // 15 seconds
-const recentEvents = new Map(); // key → timestamp
+// ── Unified dedup: normalized key across ALL event sources ────────────
+const DEDUP_WINDOW_MS = 15000;
+const recentEvents = new Map();
 
+/**
+ * Normalize dedup key so WS mentions + CF webhooks about the SAME
+ * comment/task action collapse to one key.
+ *
+ * Strategy: extract the object_id (task ID) from any event source,
+ * then bucket by 5-second windows so near-simultaneous events dedup.
+ */
 function dedupKey(event) {
-  // For webhook mention events (from WS daemon), use payload hash
-  if (event.event === 'mention') {
-    // WS events don't have task_id — extract from payload
-    const p = event.payload || '';
-    const objectIdMatch = p.match(/"object_id":"([^"]+)"/);
-    return `mention:${objectIdMatch ? objectIdMatch[1] : p.substring(0, 100)}`;
+  let objectId = event.task_id || '';
+  let bucket = Math.floor(Date.now() / 5000); // 5-second buckets
+
+  // WS mention events: extract object_id from raw payload
+  if (event.event === 'mention' && event.payload) {
+    try {
+      const p = typeof event.payload === 'string' ? event.payload : JSON.stringify(event.payload);
+      const match = p.match(/"object_id":"([^"]+)"/);
+      if (match) objectId = match[1];
+    } catch {}
   }
-  return `${event.event}:${event.task_id}:${event.comment_text?.substring(0, 50) || ''}`;
+
+  // Chat mention events: use channel + message ID
+  if (event.event === 'chat_mention') {
+    return `chat:${event.channel_id || ''}:${event.message_id || ''}`;
+  }
+
+  return `${objectId}:${bucket}`;
 }
 
 function isDuplicate(event) {
@@ -46,7 +74,7 @@ function isDuplicate(event) {
     return true;
   }
   recentEvents.set(key, now);
-  // Clean old entries every 100 events
+  // Prune old entries
   if (recentEvents.size > 200) {
     for (const [k, ts] of recentEvents) {
       if (now - ts > DEDUP_WINDOW_MS * 2) recentEvents.delete(k);
@@ -55,47 +83,149 @@ function isDuplicate(event) {
   return false;
 }
 
+// ── Self-echo detection (comprehensive) ──────────────────────────────
+
+/**
+ * Check if an event was caused by our own API calls.
+ * Returns true if we should SKIP this event (it's our own echo).
+ */
+function isSelfEcho(event) {
+  // ── Check 1: WS payload audit context ──────────────────────────────
+  // WS events carry originating_service and userid in the nested context.
+  // If originating_service === "publicapi" AND userid matches ours,
+  // it's our own API comment.
+  if (event.event === 'mention' && event.payload) {
+    try {
+      const wsData = typeof event.payload === 'string' ? JSON.parse(event.payload) : event.payload;
+      const ctx = wsData?.event?.version_event_data?.context;
+      const originService = ctx?.originating_service;
+      const auditRoute = ctx?.audit_context?.route;
+      const triggerUserId = String(ctx?.audit_context?.trigger_user_id || '');
+      const userId = String(ctx?.audit_context?.userid || '');
+
+      // API-originated events from our account
+      if (originService === 'publicapi' && (userId === OUR_USER_ID || triggerUserId === OUR_USER_ID)) {
+        console.log(`[self-echo] WS mention from our API (origin=${originService}, user=${userId})`);
+        return true;
+      }
+      // Wildcard route = API call
+      if (auditRoute === '*' && (userId === OUR_USER_ID || triggerUserId === OUR_USER_ID)) {
+        console.log(`[self-echo] WS mention from our API (route=*, user=${userId})`);
+        return true;
+      }
+      // Even without publicapi flag: if it's our user ID posting via API route
+      if (originService === 'publicapi') {
+        console.log(`[self-echo] WS mention from publicapi (any user — playing safe)`);
+        return true;
+      }
+    } catch {}
+  }
+
+  // ── Check 2: CF webhook history_items ──────────────────────────────
+  if (event.raw?.history_items) {
+    for (const hi of event.raw.history_items) {
+      // Check comment author — if it's our user ID, it's likely us
+      const authorId = String(hi.user?.id || hi.comment?.user?.id || '');
+      if (authorId === OUR_USER_ID) {
+        // Could be human Jake posting from ClickUp UI OR our API.
+        // Check text for Oogie patterns to distinguish.
+        const txt = hi.comment?.text_content || hi.comment?.comment_text || '';
+        if (hasOogieSignature(txt)) {
+          console.log('[self-echo] CF webhook: Oogie signature in comment from our user ID');
+          return true;
+        }
+      }
+    }
+  }
+
+  // ── Check 3: Normalized comment_text patterns ──────────────────────
+  if (event.comment_text && hasOogieSignature(event.comment_text)) {
+    console.log('[self-echo] Oogie signature in comment_text');
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Check if text contains known Oogie/Buba response signatures.
+ */
+function hasOogieSignature(text) {
+  if (!text) return false;
+  const signatures = [
+    '— Oogie', '— sonnet', '— opus',
+    'ʕ•ᴥ•ʔ', 'ᕕ( ᐛ )ᕗ', '(╯°□°)╯',
+    'ಠ_ಠ', '¯\\_(ツ)_/¯',
+    'Test successful - Oogie',
+  ];
+  return signatures.some(sig => text.includes(sig));
+}
+
+// ── HTTP Server ──────────────────────────────────────────────────────
+
 const server = http.createServer(async (req, res) => {
   // Health check
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'clickup-event-handler', uptime: process.uptime() }));
+    res.end(JSON.stringify({
+      status: 'ok',
+      service: 'clickup-event-handler',
+      uptime: process.uptime(),
+      our_user_id: OUR_USER_ID,
+    }));
     return;
   }
 
-  // Main event receiver
-  if (req.method === 'POST' && (req.url === '/clawdbot/clickup' || req.url === '/clickup/event')) {
+  // Event receivers (all 3 paths)
+  if (req.method === 'POST' && (
+    req.url === '/clawdbot/clickup' ||
+    req.url === '/clickup/event' ||
+    req.url === '/clickup/chat-mention'
+  )) {
     let body = '';
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
       try {
         const event = JSON.parse(body);
-        
-        // Log the event
-        const logEntry = { ...event, received_at: new Date().toISOString() };
-        fs.appendFileSync(EVENT_LOG, JSON.stringify(logEntry) + '\n');
-        
-        console.log(`[${new Date().toISOString()}] Event: ${event.event} task=${event.task_id} oogie=${event.mentioned_oogie}`);
 
-        // Dedup: skip if we've seen this exact event recently
+        // Tag the input path for logging
+        const inputPath = req.url === '/clickup/event' ? 'ws'
+          : req.url === '/clickup/chat-mention' ? 'chat'
+          : 'webhook';
+
+        // Log the event
+        const logEntry = { ...event, received_at: new Date().toISOString(), input_path: inputPath };
+        fs.appendFileSync(EVENT_LOG, JSON.stringify(logEntry) + '\n');
+
+        console.log(`[${new Date().toISOString()}] [${inputPath}] Event: ${event.event} task=${event.task_id || '—'} mention=${event.mentioned_oogie || '—'}`);
+
+        // ── Step 1: Dedup (unified across all paths) ─────────────────
         if (isDuplicate(event)) {
-          console.log(`[dedup] Skipping duplicate: ${event.event} task=${event.task_id}`);
+          console.log(`[dedup] Skipping: ${event.event} (${inputPath})`);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, woke: false, reason: 'dedup' }));
           return;
         }
 
-        // Decide whether to wake Clawdbot
+        // ── Step 2: Self-echo filter ─────────────────────────────────
+        if (isSelfEcho(event)) {
+          console.log(`[self-echo] Blocked: ${event.event} (${inputPath})`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, woke: false, reason: 'self-echo' }));
+          return;
+        }
+
+        // ── Step 3: Should we wake Clawdbot? ─────────────────────────
         const shouldWake = shouldTriggerWake(event);
-        
+
         if (shouldWake) {
           const wakeText = buildWakeText(event);
-          console.log(`[wake] Triggering: ${wakeText.substring(0, 100)}...`);
+          console.log(`[wake] Triggering (${inputPath}): ${wakeText.substring(0, 120)}...`);
           await triggerCronWake(wakeText);
         }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, woke: shouldWake }));
+        res.end(JSON.stringify({ ok: true, woke: shouldWake, path: inputPath }));
       } catch (err) {
         console.error(`[error] ${err.message}`);
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -105,164 +235,151 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 404
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'not found' }));
 });
 
-/**
- * Determine if an event should wake Clawdbot.
- * We don't want to wake on every single event — only meaningful ones.
- */
+// ── Wake decision logic ──────────────────────────────────────────────
+
 function shouldTriggerWake(event) {
-  // ── Self-echo prevention ─────────────────────────────────────────
-  // When Oogie posts a comment via the ClickUp API, ClickUp fires a
-  // webhook for that comment. We must NOT wake on our own comments or
-  // we get an infinite loop.
-  //
-  // Detection methods (any one is sufficient):
-  // 1. originating_service === "publicapi" (API-posted comments)
-  // 2. audit_context.route === "*" (API route wildcard)
-  // 3. Comment text contains known Oogie signatures
-  const rawPayload = event.raw || {};
-  const historyItems = rawPayload.history_items || [];
-  
-  for (const item of historyItems) {
-    // Check originating_service from the context
-    const ctx = item?.comment?._version_vector ? null : null; // not here
-    const auditCtx = rawPayload?.history_items?.[0]?.data || {};
-    
-    // For CF webhook events: check the raw audit context
-    // The route field is "*" for API-posted comments
-    if (event.raw?.history_items) {
-      for (const hi of event.raw.history_items) {
-        if (hi.source === null && hi.user?.id === 126241816) {
-          // This is our own API user posting — but we need to distinguish
-          // human-posted (via ClickUp UI) vs API-posted comments.
-          // Unfortunately they both come from the same user ID.
-        }
-      }
-    }
-  }
+  // Chat mentions always wake
+  if (event.event === 'chat_mention') return true;
 
-  // Method 1: Check for WebSocket "mention" events with publicapi origin
-  if (event.event === 'mention' && event.payload) {
-    try {
-      const wsData = typeof event.payload === 'string' ? JSON.parse(event.payload) : event.payload;
-      const originService = wsData?.event?.version_event_data?.context?.originating_service;
-      const route = wsData?.event?.version_event_data?.context?.audit_context?.route;
-      if (originService === 'publicapi' || route === '*') {
-        console.log(`[filter] Skipping self-echo (WS mention, origin=${originService}, route=${route})`);
-        return false;
-      }
-    } catch {}
-  }
+  // WS mention events (already passed self-echo filter)
+  if (event.event === 'mention') return true;
 
-  // Method 2: Check CF webhook events for publicapi origin
-  if (event.raw?.history_items) {
-    for (const hi of event.raw.history_items) {
-      // The source field is null for both UI and API posts, but we can
-      // check the comment text for Oogie patterns
-      if (hi.comment?.text_content) {
-        const txt = hi.comment.text_content;
-        // Known Oogie signatures and patterns
-        if (txt.includes('— Oogie') || txt.includes('ʕ•ᴥ•ʔ') || 
-            txt.includes('ᕕ( ᐛ )ᕗ') || txt.includes('— sonnet') ||
-            txt.includes('— opus')) {
-          console.log('[filter] Skipping self-echo (Oogie signature in comment text)');
-          return false;
-        }
-      }
-    }
-  }
-  
-  // Method 3: Simple text check on normalized comment_text
-  if (event.comment_text) {
-    const ct = event.comment_text;
-    if (ct.includes('— Oogie') || ct.includes('ʕ•ᴥ•ʔ') || 
-        ct.includes('ᕕ( ᐛ )ᕗ') || ct.includes('— sonnet') || 
-        ct.includes('— opus') || ct.includes('Test successful - Oogie')) {
-      console.log('[filter] Skipping self-echo (Oogie pattern in comment_text)');
-      return false;
-    }
-  }
+  // CF webhook: @Oogie mentioned in comment
+  if (event.mentioned_oogie) return true;
 
-  // Always wake if someone mentioned @Oogie
-  if (event.mentioned_oogie || event.event === "mention") return true;
-  
-  // Only wake on comments if Oogie was mentioned (handled above)
-  // Do NOT wake on every comment — causes self-echo loops
+  // Task comment without mention — don't wake (prevents echo loops)
   if (event.event === 'taskCommentPosted') return false;
   if (event.event === 'taskUpdated' && event.comment_text) return false;
-  
-  // Wake on new task creation (for awareness)
+
+  // New task creation
   if (event.event === 'taskCreated') return true;
-  
-  // Wake on task assignment changes (someone assigned to Oogie or new assignments)
+
+  // Assignment changes
   if (event.event === 'taskAssigneeUpdated') return true;
-  
-  // Wake on status changes to blocked (might need help)
+
+  // Status → blocked
   if (event.event === 'taskStatusUpdated') {
-    const raw = event.raw || {};
-    const historyItems = raw.history_items || [];
+    const historyItems = event.raw?.history_items || [];
     for (const item of historyItems) {
       if (item.after && typeof item.after === 'string' && item.after.toLowerCase().includes('block')) {
         return true;
       }
     }
   }
-  
-  // Don't wake on routine updates (due date tweaks, priority changes, etc.)
+
   return false;
 }
 
+// ── Wake text builder (simplified — uses CLI directly) ───────────────
+
 /**
- * Build the wake text that Clawdbot will process as a system event.
+ * Build wake text that Clawdbot can process in a single agent turn.
+ * Uses the ClickUp CLI directly — no shell scripts, no curl, no signet secret exec.
+ *
+ * The CLI reads the API key from ~/.agents/secrets/clickup-api-key.txt automatically.
  */
 function buildWakeText(event) {
-  // WebSocket mention events get fast-tracked with raw payload context
-  if (event.event === "mention") {
-    const rawSnippet = event.payload ? event.payload.substring(0, 500) : '';
-    return 'ClickUp Realtime WebSocket Alert: You were just tagged in ClickUp! '
-      + 'The raw WebSocket payload is: ' + rawSnippet
-      + '. Please use your ClickUp skill to read the latest comments and reply natively.';
+  const cliEnv = `CLICKUP_API_KEY=$(cat ${API_KEY_FILE}) CLICKUP_WORKSPACE_ID=${WORKSPACE_ID}`;
+  const cli = `node ${CLI_PATH}`;
+
+  // ── Chat mention ───────────────────────────────────────────────────
+  if (event.event === 'chat_mention') {
+    const channelId = event.channel_id || '';
+    const channelName = event.channel_name || 'a chat channel';
+    const senderName = event.sender_name || 'Someone';
+    const messageText = event.message_text || '';
+    const messageId = event.message_id || '';
+
+    return `[ClickUp Chat Mention] ${senderName} mentioned you in ${channelName}: "${messageText}"\n\n`
+      + `To read recent messages: ${cliEnv} ${cli} chat messages "${channelId}" --limit 10\n`
+      + (messageId
+        ? `To reply: ${cliEnv} ${cli} chat reply "${channelId}" "${messageId}" "your response here"\n`
+        : `To send: ${cliEnv} ${cli} chat send "${channelId}" "your response here"\n`)
+      + `\nRespond helpfully. Keep it concise. You are @Jake Shore (jake@burtonmethod.com) in ClickUp. Sign with — Oogie`;
   }
 
+  // ── WS mention (raw payload) ───────────────────────────────────────
+  if (event.event === 'mention') {
+    // Extract task/object ID from WS payload
+    let objectId = '';
+    let eventName = '';
+    try {
+      const wsData = typeof event.payload === 'string' ? JSON.parse(event.payload) : event.payload;
+      objectId = wsData?.event?.version_change?.object_id || '';
+      eventName = wsData?.event?.name || '';
+    } catch {}
+
+    if (objectId && (eventName.includes('Comment') || eventName.includes('comment'))) {
+      return `[ClickUp Mention] You were tagged in a comment on task ${objectId}.\n\n`
+        + `To read the task and comments: ${cliEnv} ${cli} task ${objectId}\n`
+        + `To reply: ${cliEnv} ${cli} comment ${objectId} "your response here"\n`
+        + `\nRead the comments first, understand what they're asking, then reply helpfully. `
+        + `You are @Jake Shore (jake@burtonmethod.com) in ClickUp. Sign with — Oogie`;
+    }
+
+    // Generic WS mention (non-comment, e.g. task update)
+    if (objectId) {
+      return `[ClickUp Mention] Activity on task ${objectId} (${eventName}).\n\n`
+        + `To read: ${cliEnv} ${cli} task ${objectId}\n`
+        + `To comment: ${cliEnv} ${cli} comment ${objectId} "your response here"\n`
+        + `\nReview and respond if needed. You are @Jake Shore in ClickUp. Sign with — Oogie`;
+    }
+
+    // Fallback: raw payload snippet
+    const snippet = (event.payload || '').substring(0, 300);
+    return `[ClickUp Mention] Raw WebSocket alert (could not parse task ID): ${snippet}\n`
+      + `\nUse the ClickUp CLI to investigate. Sign replies with — Oogie`;
+  }
+
+  // ── CF webhook: @Oogie mentioned in task comment ───────────────────
   const userName = event.user?.username || 'Someone';
   const taskId = event.task_id || 'unknown';
-  
+
   if (event.mentioned_oogie && event.comment_text) {
-    return `ClickUp @Oogie mention: ${userName} mentioned you in a comment on task ${taskId}. Comment: "${event.comment_text}". To read the task and comments, write a shell script to /tmp/cu_read.sh that uses curl with the API key from the CLICKUP_BURTONMETHOD_KEY env var, then run it with: signet secret exec --secret CLICKUP_BURTONMETHOD_KEY -- bash /tmp/cu_read.sh. To post a reply, write a script to /tmp/cu_reply.sh that posts via curl, then run it the same way. The ClickUp API base is https://api.clickup.com/api/v2. Respond helpfully — answer their question, offer help, or acknowledge. Keep your reply concise. Sign with — Oogie.`;
-  }
-  
-  if (event.event === 'taskCommentPosted') {
-    return `ClickUp comment on task ${taskId}: ${userName} said "${event.comment_text || '(no text)'}". If a response would be helpful, write a shell script to post a reply via ClickUp API and run with signet secret exec. Otherwise NO_REPLY.`;
-  }
-  
-  if (event.event === 'taskCreated') {
-    return `ClickUp new task created by ${userName} (ID: ${taskId}). Review if needed, otherwise NO_REPLY.`;
-  }
-  
-  if (event.event === 'taskAssigneeUpdated') {
-    return `ClickUp assignment change by ${userName} on task ${taskId}. Review if needed, otherwise NO_REPLY.`;
+    return `[ClickUp @Oogie Mention] ${userName} mentioned you on task ${taskId}.\n`
+      + `Comment: "${event.comment_text}"\n\n`
+      + `To read full context: ${cliEnv} ${cli} task ${taskId}\n`
+      + `To reply: ${cliEnv} ${cli} comment ${taskId} "your response here"\n`
+      + `\nRead the task first, then reply helpfully to their question. `
+      + `You are @Jake Shore (jake@burtonmethod.com) in ClickUp. Sign with — Oogie`;
   }
 
-  if (event.event === 'taskStatusUpdated') {
-    return `ClickUp status change by ${userName} on task ${taskId} to a blocked state. Check if you can help. Otherwise NO_REPLY.`;
+  // ── Task created ───────────────────────────────────────────────────
+  if (event.event === 'taskCreated') {
+    return `[ClickUp] New task created by ${userName} (ID: ${taskId}).\n`
+      + `To read: ${cliEnv} ${cli} task ${taskId}\n`
+      + `Review if needed, otherwise NO_REPLY.`;
   }
-  
-  return `ClickUp event: ${event.event} on task ${taskId} by ${userName}. Review if action needed. NO_REPLY if routine.`;
+
+  // ── Assignment change ──────────────────────────────────────────────
+  if (event.event === 'taskAssigneeUpdated') {
+    return `[ClickUp] Assignment change by ${userName} on task ${taskId}.\n`
+      + `To read: ${cliEnv} ${cli} task ${taskId}\n`
+      + `Review if needed, otherwise NO_REPLY.`;
+  }
+
+  // ── Status → blocked ───────────────────────────────────────────────
+  if (event.event === 'taskStatusUpdated') {
+    return `[ClickUp] Task ${taskId} moved to blocked by ${userName}.\n`
+      + `To read: ${cliEnv} ${cli} task ${taskId}\n`
+      + `Check if you can help. Otherwise NO_REPLY.`;
+  }
+
+  // ── Generic fallback ───────────────────────────────────────────────
+  return `[ClickUp] Event: ${event.event} on task ${taskId} by ${userName}.\n`
+    + `To read: ${cliEnv} ${cli} task ${taskId}\n`
+    + `Review if action needed. NO_REPLY if routine.`;
 }
 
-/**
- * Trigger a Clawdbot agent run via the Gateway /hooks/agent endpoint.
- * This spawns an isolated agent turn that can read the ClickUp task,
- * process the mention, and post a comment back — all in one shot.
- */
+// ── Trigger Clawdbot wake ────────────────────────────────────────────
+
 async function triggerCronWake(text) {
-  const http = require('http');
   const extraInstructions = process.env.CLICKUP_WAKE_INSTRUCTIONS || '';
-  const fullText = text + (extraInstructions ? ' ' + extraInstructions : '');
+  const fullText = text + (extraInstructions ? '\n' + extraInstructions : '');
   const gatewayPort = process.env.CLAWDBOT_GATEWAY_PORT || 18789;
   const hookToken = process.env.CLAWDBOT_HOOK_TOKEN || 'qnLSLAojTmhgdA4vktyaDsoDyvL9yUT_fPVR32vSdxk';
 
@@ -271,7 +388,7 @@ async function triggerCronWake(text) {
     name: 'ClickUp',
     wakeMode: 'now',
     deliver: false,
-    timeoutSeconds: 60,
+    timeoutSeconds: 90,
   });
 
   return new Promise((resolve) => {
@@ -310,11 +427,14 @@ async function triggerCronWake(text) {
   });
 }
 
+// ── Start server ─────────────────────────────────────────────────────
+
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`[clickup-event-handler] Listening on 127.0.0.1:${PORT}`);
+  console.log(`[clickup-event-handler] v2 — Listening on 127.0.0.1:${PORT}`);
+  console.log(`[clickup-event-handler] Our user: ${OUR_USER_ID} (jake@burtonmethod.com)`);
+  console.log(`[clickup-event-handler] CLI: ${CLI_PATH}`);
   console.log(`[clickup-event-handler] Event log: ${EVENT_LOG}`);
 });
 
-// Graceful shutdown (PM2 sends SIGTERM on restart/cron_restart)
 process.on('SIGTERM', () => { console.log('[shutdown] SIGTERM'); server.close(); process.exit(0); });
 process.on('SIGINT', () => { console.log('[shutdown] SIGINT'); server.close(); process.exit(0); });
